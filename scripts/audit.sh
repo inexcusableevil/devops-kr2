@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -uo pipefail
+PASS=0; FAIL=0
+check() {
+    local desc="$1" expected="$2" actual="$3"
+    if [[ "$actual" == "$expected" ]]; then
+        echo "  [OK]   $desc"; ((PASS+=1))
+    else
+        echo "  [FAIL] $desc (ожидалось: '$expected', получено: '$actual')"
+        ((FAIL+=1))
+    fi
+}
+echo "Аудит конфигурации: $(hostname -f), $(date '+%Y-%m-%d %H:%M')"
+echo "[1] Служба SSH"
+SSH_CONFIG="$(sudo sshd -T)"
+check "Вход от имени root запрещён" "no" "$(awk '/^permitrootlogin /{print $2}' <<< "$SSH_CONFIG")"
+check "Парольная аутентификация отключена" "no" "$(awk '/^passwordauthentication /{print $2}' <<< "$SSH_CONFIG")"
+SSH_PORT="$(awk '/^port /{print $2;exit}' <<< "$SSH_CONFIG")"
+NONSTANDARD=no
+[[ "$SSH_PORT" =~ ^[0-9]+$ && "$SSH_PORT" -ne 22 ]] && NONSTANDARD=yes
+check "Порт SSH отличается от 22" "yes" "$NONSTANDARD"
+check "MaxAuthTries равен 3" "3" "$(awk '/^maxauthtries /{print $2}' <<< "$SSH_CONFIG")"
+echo "[2] Межсетевой экран"
+UFW_STATUS="$(LC_ALL=C sudo ufw status verbose)"
+check "Межсетевой экран активен" "active" "$(awk '/^Status:/{print $2}' <<< "$UFW_STATUS")"
+check "Входящий трафик запрещён по умолчанию" "deny" "$(sed -nE 's/^Default: ([^ ]+) \(incoming\).*/\1/p' <<< "$UFW_STATUS")"
+echo "[3] Учётные записи"
+awk -F: '$3>=1000 && $3<65534 {printf "    %s (uid=%s)\n",$1,$3}' /etc/passwd
+echo "[4] Веб-сервер"
+check "Служба nginx активна" "active" "$(systemctl is-active nginx)"
+NGINX_SYNTAX=no
+sudo nginx -t >/dev/null 2>&1 && NGINX_SYNTAX=yes
+check "Конфигурация nginx корректна" "yes" "$NGINX_SYNTAX"
+CERT_MIN_DAYS="${CERT_MIN_DAYS:-30}"
+CERT_OK=no
+if [[ "$CERT_MIN_DAYS" =~ ^[0-9]+$ ]] && \
+    openssl x509 -in /etc/ssl/certs/devops.crt -noout \
+    -checkend "$((CERT_MIN_DAYS * 86400))" >/dev/null 2>&1; then
+    CERT_OK=yes
+fi
+check "Сертификат действителен ещё минимум ${CERT_MIN_DAYS} дней" "yes" "$CERT_OK"
+WEB_PERMISSIONS=no
+WORLD_WRITABLE="$(find /var/www/devops-site -perm -o+w 2>&1)"
+KEY_MODE="$(sudo stat -c '%a' /etc/ssl/private/devops.key)"
+[[ -z "$WORLD_WRITABLE" && "$KEY_MODE" == 600 ]] && WEB_PERMISSIONS=yes
+check "Нет записи для всех; закрытый ключ имеет права 600" "yes" "$WEB_PERMISSIONS"
+echo "[5] Контейнеризация"
+check "Служба docker активна" "active" "$(systemctl is-active docker)"
+check "Контейнер СУБД healthy" "healthy" "$(docker inspect -f '{{.State.Health.Status}}' app-db-1 2>/dev/null)"
+UNSAFE_PORTS="$(ss -H -tln | awk '$4 ~ /:(5000|5432)$/ && $4 !~ /^127[.]0[.]0[.]1:/ {print $4}')"
+check "Порты 5000 и 5432 не доступны на внешних адресах" "" "$UNSAFE_PORTS"
+APP_DIR="$(getent passwd devops | cut -d: -f6)/app"
+check "Права файла .env равны 600" "600" "$(stat -c '%a' "${APP_DIR}/.env" 2>/dev/null)"
+echo "[6] Контрольная работа № 2"
+KR2_DIR="$(getent passwd devops | cut -d: -f6)/kr2"
+KR2_REDIS_ID="$(docker compose --project-directory "$KR2_DIR" ps -q redis 2>/dev/null)"
+check "Redis healthy" "healthy" "$(docker inspect -f '{{.State.Health.Status}}' "$KR2_REDIS_ID" 2>/dev/null)"
+check "Приложение доступно только на 127.0.0.1:8001" "127.0.0.1:8001" "$(docker compose --project-directory "$KR2_DIR" port app 8001 2>/dev/null)"
+check "Права kr2/.env равны 600" "600" "$(stat -c '%a' "$KR2_DIR/.env" 2>/dev/null)"
+KR2_CERT_OK=no
+openssl x509 -in /etc/ssl/certs/kr2.crt -noout -checkend 2592000 >/dev/null 2>&1 && KR2_CERT_OK=yes
+check "Сертификат КР2 действителен минимум 30 дней" "yes" "$KR2_CERT_OK"
+KR2_SITE_OK=no
+[[ -L /etc/nginx/sites-enabled/kr2 && "$(readlink -f /etc/nginx/sites-enabled/kr2)" == /etc/nginx/sites-available/kr2 ]] && KR2_SITE_OK=yes
+check "Ресурс kr2 активирован" "yes" "$KR2_SITE_OK"
+echo "Пройдено: $PASS, не пройдено: $FAIL"
+[[ $FAIL -eq 0 ]] && exit 0 || exit 1
