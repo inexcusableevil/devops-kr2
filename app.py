@@ -1,3 +1,4 @@
+# KR2: Tarakanov
 import os
 import socket
 
